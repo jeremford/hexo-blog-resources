@@ -1,0 +1,436 @@
+Description: Static S3 and CloudFront Blog
+Parameters:
+  BlogName:
+    Description: Blog Name
+    Type: String
+  BlogRepositoryName:
+    Description: Code Commit repository name for the blog.
+    Type: String
+    AllowedPattern: "[\\w\\.-]+"
+    MinLength: 1
+    MaxLength: 100
+  RepositoryBranch:
+    Type: String
+    Default: master
+  BlogS3Path:
+    Description: Blog Path within the S3 Bucket (e.g. /public)
+    Type: String
+    Default: "/public"
+  ACMCertificateARN:
+    Description: ARN for certificate to be used by CloudFront (in us-east-1)
+    Type: String
+  Domain:
+    Description: FQDN DNS for Blog (e.g. my-blog.example.com)
+    Type: String
+  HostedZoneId:
+    Description: Hosted Zone Id of the Route53 domain (example.com) that will be updated
+    Type: String
+  Email:
+    Description: Email address to be used for SNS Notifications
+    Type: String
+
+Resources:
+
+  BlogSNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+
+  BlogRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref BlogRepositoryName
+      RepositoryDescription: !Sub "Git repository for ${BlogName}"
+      Triggers:
+      - Name: MasterTrigger
+        CustomData: !Sub "Blog - ${BlogName}"
+        DestinationArn:
+          Ref: BlogSNSTopic
+        Branches:
+        - Master
+        Events:
+        - all
+
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codepipeline.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: codepipeline-service
+        PolicyDocument:
+          Statement:
+          - Action:
+            - codepipeline:*
+            - iam:ListRoles
+            - cloudformation:Describe*
+            - cloudFormation:List*
+            - codecommit:List*
+            - codecommit:Get*
+            - codecommit:GitPull
+            - codecommit:UploadArchive
+            - codecommit:CancelUploadArchive
+            - codebuild:BatchGetBuilds
+            - codebuild:StartBuild
+            - cloudformation:CreateStack
+            - cloudformation:DeleteStack
+            - cloudformation:DescribeStacks
+            - cloudformation:UpdateStack
+            - cloudformation:CreateChangeSet
+            - cloudformation:DeleteChangeSet
+            - cloudformation:DescribeChangeSet
+            - cloudformation:ExecuteChangeSet
+            - cloudformation:SetStackPolicy
+            - cloudformation:ValidateTemplate
+            - iam:PassRole
+            - s3:ListAllMyBuckets
+            - s3:GetBucketLocation
+            Resource: "*"
+            Effect: Allow
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetBucketPolicy
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+             - !Join ['',['arn:aws:s3:::',!Ref PipelineArtifactsBucket, '/*']]
+             - !Join ['',['arn:aws:s3:::',!Ref PipelineArtifactsBucket]]
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetBucketPolicy
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+             - !Join ['',['arn:aws:s3:::',!Ref BlogBucket, '/*']]
+             - !Join ['',['arn:aws:s3:::',!Ref BlogBucket]]
+          Version: '2012-10-17'
+
+  BlogCodeBuildRole:
+    Type: AWS::IAM::Role
+    Description: Creating service role in IAM for AWS CodeBuild
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+      Path: /
+      RoleName: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - CodeBuild
+
+  BlogCodeBuildPolicy:
+    Type: AWS::IAM::Policy
+    Description: Setting IAM policy for service role for CodeBuild
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Action:
+          - logs:CreateLogGroup
+          - logs:CreateLogStream
+          - logs:PutLogEvents
+          Effect: Allow
+          Resource: '*'
+        -
+          Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetBucketPolicy
+            - s3:GetObject
+            - s3:ListBucket
+          Resource:
+           - !Join ['',['arn:aws:s3:::',!Ref PipelineArtifactsBucket, '/*']]
+           - !Join ['',['arn:aws:s3:::',!Ref PipelineArtifactsBucket]]
+        - Action:
+          - codecommit:GitPull
+          Effect: Allow
+          Resource:
+          - !Join
+            - ':'
+            - - arn
+              - aws
+              - codecommit
+              - !Ref 'AWS::Region'
+              - !Ref 'AWS::AccountId'
+              - !Ref BlogRepositoryName
+        - Action:
+          - kms:GenerateDataKey*
+          - kms:Encrypt
+          - kms:Decrypt
+          Effect: Allow
+          Resource:
+          - !Join
+            - ':'
+            - - arn:aws:kms
+              - !Ref 'AWS::Region'
+              - !Ref 'AWS::AccountId'
+              - !Join
+                - /
+                - - alias
+                  - aws/s3
+      PolicyName: !Join
+        - '-'
+        -  - !Ref 'AWS::StackName'
+           - CodeBuildPolicy
+      Roles:
+      - !Ref BlogCodeBuildRole
+
+  BlogCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${BlogRepositoryName}-build-deploy-s3"
+      Description: !Sub "Build project for ${Domain}"
+      ServiceRole: !GetAtt BlogCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:10.14.1
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BlogRepositoryName
+          StreamName: "/aws/codebuild/"
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Blog
+          Value: !Ref BlogName
+        - Key: Domain
+          Value: !Ref Domain
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Location: !Ref PipelineArtifactsBucket
+        Type: S3
+      Stages:
+      - Name: Source
+        Actions:
+          - InputArtifacts: []
+            Name: Source
+            ActionTypeId:
+              Category: Source
+              Owner: AWS
+              Version: 1
+              Provider: CodeCommit
+            OutputArtifacts:
+              - Name: BlogContent
+            Configuration:
+              BranchName: !Ref RepositoryBranch
+              RepositoryName: !Ref BlogRepositoryName
+            RunOrder: 1
+      - Name: Build
+        Actions:
+        - Name: CodeBuild
+          ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Provider: CodeBuild
+            Version: '1'
+          InputArtifacts:
+            - Name: BlogContent
+          OutputArtifacts:
+          - Name: PublicFiles
+          Configuration:
+            ProjectName: !Ref BlogCodeBuildProject
+          RunOrder: 1
+      - Name: Deploy
+        Actions:
+        - Name: S3Deploy
+          ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Provider: S3
+            Version: '1'
+          InputArtifacts:
+            - Name: PublicFiles
+          Configuration:
+            BucketName: !Ref BlogBucket
+            Extract: 'true'
+          RunOrder: 1
+
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment:  !Sub "Exclusive access to ${BlogName} s3 bucket"
+
+  BlogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: 404.html
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+      - Key: Name
+        Value: !Sub ${BlogName}-Bucket
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn:
+      - BlogBucket
+      - CloudFrontOriginAccessIdentity
+    Properties:
+      Bucket:
+        Ref: BlogBucket
+      PolicyDocument:
+        Statement:
+        - Action:
+            - "s3:GetObject"
+          Effect: Allow
+          Principal:
+            CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+          Resource:
+            Fn::Join:
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref BlogBucket
+                - "/*"
+
+  DistributionConfig:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+    - BlogBucket
+    Properties:
+      DistributionConfig:
+        Comment: !Sub ${BlogName}Cloudfront
+        Aliases:
+        - Ref: Domain
+        DefaultCacheBehavior:
+          AllowedMethods:
+          - GET
+          - HEAD
+          Compress: true
+          ForwardedValues:
+            Cookies:
+              Forward: none
+            QueryString: 'false'
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !Ref BlogOriginRequestLambdaFunctionVersion
+        DefaultRootObject: index.html
+        Enabled: true
+        Origins:
+        - DomainName: !GetAtt BlogBucket.DomainName
+          Id: S3Origin
+          S3OriginConfig:
+            OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}"
+        PriceClass: PriceClass_All
+        ViewerCertificate:
+          AcmCertificateArn:
+            Ref: ACMCertificateARN
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2018
+
+  BlogOriginRequestLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: >
+        Lambda function performing request URI rewriting for index.html.
+      Code:
+        ZipFile: |
+          const path = require('path');
+          exports.handler = async (event) => {
+            var request = event.Records[0].cf.request;
+            // Rewrite clean URLs (adding index.html)
+            if (!path.extname(request.uri)) {
+              request.uri = request.uri.replace(/\/?$/, '\/index.html');
+            }
+            return request;
+          };
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt BlogOriginRequestLambdaFunctionExecutionRole.Arn
+      Runtime: nodejs10.x
+      Tags:
+        - Key: Domain
+          Value: !Ref Domain
+
+  BlogOriginRequestLambdaFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref BlogOriginRequestLambdaFunction
+      Description: !Sub "URL rewriting for ${Domain}"
+
+  BlogOriginRequestLambdaFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - edgelambda.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  BlogDNSRecordSet:
+    Type: AWS::Route53::RecordSet
+    DependsOn:
+      - DistributionConfig
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      AliasTarget:
+          DNSName: !GetAtt DistributionConfig.DomainName
+          HostedZoneId: "Z2FDTNDATAQYW2"
+      Name:
+        Fn::Join:
+          - ''
+          - - Ref: Domain
+            - .
+      Type: A
+
+Outputs:
+  S3BucketId:
+    Value:
+      Ref: BlogBucket
